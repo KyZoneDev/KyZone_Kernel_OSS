@@ -1,0 +1,130 @@
+name: Build OSS Kernel Garnet (KSU-Next + SUSFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: 'Branch Kernel OSS Garnet (Pilih 16.0 untuk stabil)'
+        required: true
+        default: '16.0'
+        type: choice
+        options:
+          - '16.0'
+          - '17.0'
+          - '15.0'
+      update_ksun:
+        description: 'Paksa update KernelSU-Next ke versi paling baru?'
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 1. Bersihkan Ruang Penyimpanan Server
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get clean
+          df -h
+
+      - name: 2. Install Paket Pendukung Kompilasi
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev \
+            lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync \
+            schedtool squashfs-tools xsltproc zip zlib1g-dev python-is-python3 \
+            pahole dwarves zstd jq
+
+      - name: 3. Download Source Kernel OSS Garnet
+        run: |
+          git clone --depth=1 -b ${{ github.event.inputs.kernel_branch }} \
+            https://github.com/crdroidandroid/android_xiaomi_kernel_garnet.git kernel
+          cd kernel
+          echo "Berhasil clone branch ${{ github.event.inputs.kernel_branch }}"
+
+      - name: 4. Cek & Integrasi KernelSU-Next + SUSFS
+        run: |
+          cd kernel
+          if [ "${{ github.event.inputs.update_ksun }}" = "true" ] || [ ! -d "KernelSU-Next" ] && [ ! -d "drivers/kernelsu" ]; then
+            echo "Menyuntikkan KernelSU-Next (branch dev-susfs)..."
+            rm -rf KernelSU-Next drivers/kernelsu
+            curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
+          else
+            echo "KernelSU-Next + SUSFS sudah terintegrasi bawaan di source ini. Melewati patch ulang agar bebas error."
+          fi
+
+      - name: 5. Download Toolchain Clang Terbaru (AOSP Clang)
+        run: |
+          mkdir -p clang
+          CLANG_URL=$(curl -s https://api.github.com/repos/ZyCromerZ/Clang/releases/latest | jq -r '.assets[0].browser_download_url')
+          curl -L "$CLANG_URL" -o clang.tar.gz
+          tar -xzf clang.tar.gz -C clang
+          rm clang.tar.gz
+
+      - name: 6. Siapkan Konfigurasi Defconfig Garnet (KSU + SUSFS)
+        run: |
+          cd kernel
+          export PATH="${GITHUB_WORKSPACE}/clang/bin:${PATH}"
+          
+          # Deteksi file defconfig yang tersedia di source
+          if [ -f "arch/arm64/configs/vendor/garnet_GKI.config" ]; then
+            make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig vendor/garnet_GKI.config
+          elif [ -f "arch/arm64/configs/garnet_defconfig" ]; then
+            make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 garnet_defconfig
+          else
+            make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+          fi
+
+          # Pastikan fitur KernelSU dan SUSFS aktif di dalam .config
+          ./scripts/config --file out/.config \
+            -e KSU \
+            -e KSU_SUSFS \
+            -e KSU_SUSFS_SUS_PATH \
+            -e KSU_SUSFS_SUS_MOUNT \
+            -e KSU_SUSFS_SUS_KSTAT \
+            -e KSU_SUSFS_SPOOF_UNAME \
+            -e KSU_SUSFS_ENABLE_LOG \
+            -e KSU_SUSFS_OPEN_REDIRECT \
+            -d LOCALVERSION_AUTO
+
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+
+      - name: 7. Mulai Kompilasi Kernel (Build)
+        run: |
+          cd kernel
+          export PATH="${GITHUB_WORKSPACE}/clang/bin:${PATH}"
+          make -j$(nproc --all) O=out \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            Image
+
+      - name: 8. Bungkus ke Flashable Zip (AnyKernel3)
+        run: |
+          if [ ! -f "kernel/out/arch/arm64/boot/Image" ]; then
+            echo "ERROR: File Image kernel tidak ditemukan!"
+            exit 1
+          fi
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git AnyKernel3/README.md
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/
+
+          # Sesuaikan konfigurasi AnyKernel3 untuk Xiaomi Garnet (GKI boot)
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+          sed -i 's|block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;|block=auto;|g' AnyKernel3/anykernel.sh
+          sed -i 's/is_slot_device=0;/is_slot_device=1;/g' AnyKernel3/anykernel.sh
+
+          cd AnyKernel3
+          zip -r9 "${GITHUB_WORKSPACE}/Garnet-OSS-KSUNext-SUSFS-$(date +%Y%m%d).zip" *
+
+      - name: 9. Upload Hasil Build ke Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel-Garnet-KSUNext-SUSFS
+          path: ${{ github.workspace }}/Garnet-OSS-KSUNext-SUSFS-*.zip
+          retention-days: 14
