@@ -1,10 +1,10 @@
-name: Build OSS Kernel Garnet (KSU-Next + SUSFS)
+name: Build OSS Kernel Garnet (Clean Build)
 
 on:
   workflow_dispatch:
     inputs:
       kernel_branch:
-        description: 'Branch Kernel OSS Garnet (Pilih 16.0 untuk stabil)'
+        description: 'Branch Kernel OSS Garnet'
         required: true
         default: '16.0'
         type: choice
@@ -12,11 +12,6 @@ on:
           - '16.0'
           - '17.0'
           - '15.0'
-      update_ksun:
-        description: 'Paksa update KernelSU-Next ke versi paling baru?'
-        required: true
-        default: false
-        type: boolean
 
 jobs:
   build-kernel:
@@ -33,12 +28,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bc bison build-essential ccache curl flex \
             g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev \
-            lib32readline-dev lib32z1-dev liblz4-tool libncurses5 libncurses5-dev \
+            lib32readline-dev lib32z1-dev liblz4-tool lz4 libncurses5 libncurses5-dev \
             libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync \
             schedtool squashfs-tools xsltproc zip zlib1g-dev python-is-python3 \
-            pahole dwarves zstd jq patch
+            pahole dwarves zstd jq patch binutils xz-utils
 
-      - name: 3. Download Source Kernel Beserta Submodule
+      - name: 3. Download Source Kernel OSS Garnet Beserta Submodule
         run: |
           git clone --depth=1 --recurse-submodules -b ${{ github.event.inputs.kernel_branch }} \
             https://github.com/crdroidandroid/android_xiaomi_kernel_garnet.git kernel
@@ -55,7 +50,7 @@ jobs:
             patch -p1 --forward --fuzz=3 < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch || true
           fi
 
-          if [ "${{ github.event.inputs.update_ksun }}" = "true" ] || { [ ! -f "drivers/kernelsu/Makefile" ] && [ ! -f "drivers/kernelsu/Kbuild" ]; }; then
+          if [ ! -f "drivers/kernelsu/Makefile" ] && [ ! -f "drivers/kernelsu/Kbuild" ]; then
             rm -rf KernelSU-Next drivers/kernelsu
             curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
           fi
@@ -68,15 +63,21 @@ jobs:
           tar -xzf clang.tar.gz -C clang
           rm clang.tar.gz
 
-      - name: 6. Siapkan Konfigurasi Pure GKI Defconfig (Agar Cocok dengan Modul ROM)
+      - name: 6. Siapkan Konfigurasi Defconfig Garnet
         run: |
           cd kernel
           export PATH="${GITHUB_WORKSPACE}/clang/bin:${PATH}"
 
-          # Gunakan gki_defconfig murni agar KMI cocok dengan modul vendor_dlkm Lunaris AOSP
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+          if [ -f "arch/arm64/configs/vendor/garnet_GKI.config" ]; then
+            make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig vendor/garnet_GKI.config
+          else
+            make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+          fi
 
+          # Aktifkan KSU-Next & SUSFS secara penuh di .config
           ./scripts/config --file out/.config \
+            -d WERROR \
+            -d TRIM_UNUSED_KSYMS \
             -e KSU \
             -e KSU_SUSFS \
             -e KSU_SUSFS_SUS_PATH \
@@ -84,10 +85,7 @@ jobs:
             -e KSU_SUSFS_SUS_KSTAT \
             -e KSU_SUSFS_SPOOF_UNAME \
             -e KSU_SUSFS_ENABLE_LOG \
-            -e KSU_SUSFS_OPEN_REDIRECT \
-            -d WERROR \
-            -d LOCALVERSION_AUTO \
-            -d TRIM_UNUSED_KSYMS
+            -e KSU_SUSFS_OPEN_REDIRECT
 
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
 
@@ -109,13 +107,12 @@ jobs:
               exit 1
           fi
 
-      - name: 8. Bungkus ke AnyKernel3 Khusus GKI 2.0 (Anti-Bootloop)
+      - name: 8. Bungkus dengan AnyKernel3 Anti-Bootloop
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           rm -rf AnyKernel3/.git AnyKernel3/README.md AnyKernel3/modules AnyKernel3/patch AnyKernel3/ramdisk
           cp kernel/out/arch/arm64/boot/Image AnyKernel3/
 
-          # Buat konfigurasi anykernel.sh khusus GKI 2.0 (split_boot & flash_boot)
           cat << 'EOF' > AnyKernel3/anykernel.sh
           ### AnyKernel3 Ramdisk Mod Script
           properties() { '
@@ -125,27 +122,34 @@ jobs:
           do.systemless=1
           do.cleanup=1
           do.cleanuponabort=0
-          supported.versions=12-16
+          supported.versions=
           supported.patchlevels=
           '; }
 
-          block=boot;
-          is_slot_device=1;
-          ramdisk_compression=auto;
-          patch_vbmeta_flag=auto;
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+          NO_BLOCK_DISPLAY=1;
+          NO_MAGISK_CHECK=1;
 
           . tools/ak3-core.sh;
 
           split_boot;
-          flash_boot;
+          if [ -f "split_img/ramdisk.cpio" ]; then
+              unpack_ramdisk
+              write_boot
+          else
+              flash_boot
+          fi
           EOF
 
           cd AnyKernel3
-          zip -r9 "${GITHUB_WORKSPACE}/Garnet-GKI-KSUNext-SUSFS-$(date +%Y%m%d).zip" *
+          zip -r9 "${GITHUB_WORKSPACE}/KyZone-Garnet-KSUNext-SUSFS-$(date +%Y%m%d).zip" *
 
       - name: 9. Upload Hasil Build ke Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Kernel-Garnet-KSUNext-SUSFS
-          path: ${{ github.workspace }}/Garnet-GKI-KSUNext-SUSFS-*.zip
+          name: KyZone-Garnet-KSUNext-SUSFS
+          path: ${{ github.workspace }}/KyZone-Garnet-KSUNext-SUSFS-*.zip
           retention-days: 14
